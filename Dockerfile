@@ -10,16 +10,10 @@ COPY Gopkg.lock Gopkg.toml ./
 RUN dep ensure --vendor-only
 
 COPY . ./
-#COPY ./src /go/src/nettools/src
-
-#RUN go get -v ./...
-#RUN go install -v ./...
-
 RUN go test -v -cover ./...
 RUN CGO_ENABLED=1 GOOS=linux go build -o main -v main.go
 
 RUN chmod +x main
-#CMD /bin/bash
 EXPOSE 6000
 
 CMD ["./main"]
