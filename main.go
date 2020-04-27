@@ -1,43 +1,43 @@
 package main
 
 import (
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
-	"github.com/nu7hatch/gouuid"
-	"log"
-	"net"
-	"time"
+	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
-	"bytes"
-	"net/http"
 	"io/ioutil"
-	"strings"
-	"github.com/malfunkt/iprange"
-	"github.com/letitbeat/bpf-parser"
-	"encoding/json"
-	"strconv"
+	"log"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/pcap"
+	"github.com/letitbeat/bpf-parser"
+	"github.com/malfunkt/iprange"
+	uuid "github.com/nu7hatch/gouuid"
 )
 
 var (
-	device			= "eth0"
-	snapshotLen int32	= 1024 //65535
-	promiscuous		= false
-	timeout			= 30 * time.Second
+	device            = "eth0"
+	snapshotLen int32 = 1024 //65535
+	promiscuous       = false
+	timeout           = 30 * time.Second
 
-	err          error
-	handle       *pcap.Handle
-	buffer       gopacket.SerializeBuffer
-	options      gopacket.SerializeOptions
+	err     error
+	handle  *pcap.Handle
+	buffer  gopacket.SerializeBuffer
+	options gopacket.SerializeOptions
 
-	flagTarget		= flag.String("t", "10.0.0.252", `Target host(s). Provide a single IP: "1.2.3.4", a CIDR block "1.2.3.0/24", an IP range: "1.2.3-7.4-12", an IP with a wildcard: "1.2.3.*", or a list with any combination: "1.2.3.4, 1.2.3.0/24, ..."`)
-	flagProtocol	= flag.String("p", "TCP", "Protocol, TCP, UDP or ICMP")
-	flagDstPort  	[]string //flag. Int("dP", 80, `Destination port.`)
-	flagIF			= flag.String("it", "TCP 80", `Interesting traffic that should be generated i.e. "TCP port 80" or "UDP 20"`)
-	flagSrcIP	string
-	)
+	flagTarget   = flag.String("t", "10.0.0.252", `Target host(s). Provide a single IP: "1.2.3.4", a CIDR block "1.2.3.0/24", an IP range: "1.2.3-7.4-12", an IP with a wildcard: "1.2.3.*", or a list with any combination: "1.2.3.4, 1.2.3.0/24, ..."`)
+	flagProtocol = flag.String("p", "TCP", "Protocol, TCP, UDP or ICMP")
+	flagDstPort  []string //flag. Int("dP", 80, `Destination port.`)
+	flagIF       = flag.String("it", "TCP 80", `Interesting traffic that should be generated i.e. "TCP port 80" or "UDP 20"`)
+	flagSrcIP    string
+)
 
 // Filter used to hold the filter expression to
 // applied when generating packets.
@@ -82,8 +82,8 @@ func GenerateHandler(w http.ResponseWriter, r *http.Request) {
 
 		r := struct {
 			Response string
-			Host string
-		}{Response:"Success", Host: host }
+			Host     string
+		}{Response: "Success", Host: host}
 
 		d, err := json.Marshal(r)
 
@@ -97,7 +97,7 @@ func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Origin", "*")
 }
 
-func main()  {
+func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/generate", GenerateHandler)
@@ -107,7 +107,22 @@ func main()  {
 
 }
 
-func generate(qs map[string][]string)  {
+type protocol int8
+
+const (
+	UDP  protocol = 0
+	TCP  protocol = 1
+	ICMP protocol = 2
+)
+
+type npingParams struct {
+	ports string
+	src   string
+	dst   string
+	prot  protocol
+}
+
+func generate(qs map[string][]string) {
 
 	flag.Parse()
 
@@ -116,10 +131,13 @@ func generate(qs map[string][]string)  {
 	for k, v := range qs {
 		log.Printf("%v : %v", k, v)
 		switch strings.ToUpper(k) {
-		case "TCP", "UDP": 	*flagProtocol = k
-							flagDstPort = v
-		case "HOST", "DST": *flagTarget = v[0]
-		case "SRC": flagSrcIP = v[0]
+		case "TCP", "UDP":
+			*flagProtocol = k
+			flagDstPort = v
+		case "HOST", "DST":
+			*flagTarget = v[0]
+		case "SRC":
+			flagSrcIP = v[0]
 		}
 	}
 
@@ -140,16 +158,6 @@ func generate(qs map[string][]string)  {
 		log.Fatal(err)
 	}
 	defer handle.Close()
-
-	srcMac := getMacAddr()
-
-	log.Printf("%s", srcMac.String())
-
-	ethernetLayer := &layers.Ethernet{
-		SrcMAC: srcMac,
-		DstMAC: net.HardwareAddr{0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, //DstMAC: net.HardwareAddr{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
-		EthernetType: 0x800,
-	}
 
 	var targetAddrs []net.IP
 	if *flagTarget != "" {
@@ -175,31 +183,23 @@ func generate(qs map[string][]string)  {
 		}
 	}
 
-	// Lets fill out some information
-	ipLayer := &layers.IPv4{
-		Version: 4,
-		IHL:        5,   //uint8
-		TOS:        0,   //uint8
-		Id:         0,   //uint16
-		Flags:      0,   //IPv4Flag
-		FragOffset: 0,   //uint16
-		TTL:        255, //uint8
-		//Protocol:   6,  //IPProtocol UDP(17), TCP(6), ICMP (1) --- fill later
-		//SrcIP: net.IP{10, 0, 0, 251}, --- fill later
-		//DstIP: net.IP{10, 0, 0, 252}, --- fill later
-	}
-
 	var srcIP net.IP
 
 	if len(srcAddrs) > 0 {
-		srcIP = srcAddrs[0]    //TODO: check if we are going to allow more than one
+		srcIP = srcAddrs[0] //TODO: check if we are going to allow more than one
 	} else {
-		srcIP, err = getIP()    // Default set to host's ip
+		srcIP, err = getIP() // Default set to host's ip
 		if err != nil {
 			log.Fatal(err)
 		}
 	}
 	log.Printf(" IP: %v", srcIP)
+
+	params := npingParams{
+		ports: strings.Join(flagDstPort[:], ","),
+		dst:   *flagTarget,
+		src:   flagSrcIP,
+	}
 
 	for _, ip := range targetAddrs {
 
@@ -207,43 +207,45 @@ func generate(qs map[string][]string)  {
 			continue
 		}
 
-		ipLayer.SrcIP = srcIP
-		ipLayer.DstIP = ip
-
 		switch strings.ToUpper(*flagProtocol) {
 		case "TCP":
-			if len(flagDstPort) > 0 {
-				for _, p := range flagDstPort {
-					dstPort, err := strconv.Atoi(p)
-					if err != nil {
-						log.Fatalf("Error converting %v to use a dst port", p)
-					}
-					sendTCPPacket(ethernetLayer, ipLayer, dstPort, generatePacketId())
-				}
-			} else {
-				sendTCPPacket(ethernetLayer, ipLayer, 80, generatePacketId())
-			}
-
+			params.prot = TCP
 		case "UDP":
-			if len(flagDstPort) > 0 {
-				for _, p := range flagDstPort {
-					dstPort, err := strconv.Atoi(p)
-					if err != nil {
-						log.Fatalf("Error converting %v to use a dst port", p)
-					}
-					sendUDPPacket(ethernetLayer, ipLayer, dstPort, generatePacketId())
-				}
-			} else {
-				sendUDPPacket(ethernetLayer, ipLayer, 40, generatePacketId())
-			}
-			//sendUDPPacket(ethernetLayer, ipLayer, generatePacketId())
+			params.prot = UDP
 		case "ICMP":
 			log.Printf("Not implemented yet")
 		default:
 			log.Printf("Not valid protocol given")
 		}
-
+		executeNping(params, string(generatePacketId()))
 	}
+
+}
+
+func executeNping(params npingParams, uuid string) {
+
+	args := []string{"-c", "1", "--data-string", uuid} // default args to 1 packet only and payload uuid
+	switch params.prot {
+	case TCP:
+		args = append(args, "--tcp")
+	case UDP:
+		args = append(args, "--udp")
+	default:
+		args = append(args, "--tcp")
+	}
+
+	args = append(args, []string{"-p", params.ports}...)
+	args = append(args, params.dst)
+
+	log.Printf("CMD: %v", args)
+	cmd := exec.Command("nping", args...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("error executing nping: %s", err.Error())
+	}
+	log.Printf("Execution output: %s", string(out.Bytes()))
 }
 
 func generatePacketId() []byte {
@@ -254,83 +256,6 @@ func generatePacketId() []byte {
 	log.Printf("UUID: %v", u)
 
 	return []byte(u.String())
-}
-
-func sendTCPPacket(ethernetLayer *layers.Ethernet,
-	ipLayer *layers.IPv4,
-	dstPort int,
-	rawBytes []byte)  {
-
-	log.Printf("Sending TCP Packet to: %v", ipLayer.DstIP)
-
-	ipLayer.Protocol = 6
-
-	tcpLayer := &layers.TCP{
-		//SrcPort: layers.TCPPort(4321),
-		DstPort: layers.TCPPort(dstPort),
-	}
-	tcpLayer.SetNetworkLayerForChecksum(ipLayer)
-
-	options.FixLengths = true
-	options.ComputeChecksums = true
-
-	// Create the final packet with the layers
-	buffer = gopacket.NewSerializeBuffer()
-	err = gopacket.SerializeLayers(buffer, options,
-		ethernetLayer,
-		ipLayer,
-		tcpLayer,
-		gopacket.Payload(rawBytes),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Send our packet
-	err = handle.WritePacketData(buffer.Bytes())
-	if err != nil {
-		log.Fatal(err)
-	}
-
-}
-
-func sendUDPPacket(ethernetLayer *layers.Ethernet,
-	ipLayer *layers.IPv4,
-	dstPort int,
-	rawBytes []byte) {
-
-	log.Printf("Sending UDP Packet to: %v", ipLayer.DstIP)
-
-	ipLayer.Protocol = 17
-
-	udpLayer := &layers.UDP{
-		SrcPort: layers.UDPPort(11),
-		DstPort: layers.UDPPort(dstPort),
-	}
-
-	udpLayer.SetNetworkLayerForChecksum(ipLayer)
-
-	options.FixLengths = true
-	options.ComputeChecksums = true
-
-	// Create the final packet with the layers
-	buffer = gopacket.NewSerializeBuffer()
-	err = gopacket.SerializeLayers(buffer, options,
-		ethernetLayer,
-		ipLayer,
-		udpLayer,
-		gopacket.Payload(rawBytes),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Send our packet
-	err = handle.WritePacketData(buffer.Bytes())
-	if err != nil {
-		log.Fatal(err)
-	}
-
 }
 
 func getIP() (net.IP, error) {

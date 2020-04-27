@@ -1,7 +1,7 @@
 FROM golang:1.9 as builder
 
 RUN apt-get update \
-    && apt-get install libpcap-dev net-tools iproute2 -y \
+    && apt-get install libpcap-dev net-tools iproute2 nmap uuid-runtime -y \
     && apt-get clean
 RUN curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
 
